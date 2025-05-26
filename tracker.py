@@ -50,12 +50,12 @@ def handle_peer(conn, addr):
             if cmd == 'LOGIN':  #fazer login
                 username = msg.get('user')
                 password = msg.get('password')
-                if username in users_db:
+                if username in users_db:  #se o user existe
                     hash_pw = hashlib.sha256(password.encode()).hexdigest()
                     if hash_pw == users_db[username]:
-                        if username in active_peers:
+                        if username in active_peers:  #checa se o user ja ta logado
                             send_json(conn, {"status": "error", "msg": "Usuário já logado"})
-                        else:
+                        else:              #loga o usuario
                             user = username
                             active_peers[user] = (conn, addr)
                             send_json(conn, {"status": "ok", "msg": f"Bem vindo, {user}!"})
@@ -117,7 +117,7 @@ def handle_peer(conn, addr):
 
 def main():
     print(f"Tracker iniciando em {HOST}:{PORT}")
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:  #scoekts
         s.bind((HOST, PORT))
         s.listen()
         while True:
