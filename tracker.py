@@ -47,7 +47,7 @@ def handle_peer(conn, addr):
                 break
 
             cmd = msg.get('cmd')
-            if cmd == 'LOGIN':
+            if cmd == 'LOGIN':  #fazer login
                 username = msg.get('user')
                 password = msg.get('password')
                 if username in users_db:
@@ -65,7 +65,7 @@ def handle_peer(conn, addr):
                 else:
                     send_json(conn, {"status": "error", "msg": "Usuário não existe"})
 
-            elif cmd == 'LOGOUT':
+            elif cmd == 'LOGOUT':   #fazer logout
                 if user:
                     del active_peers[user]
                     send_json(conn, {"status": "ok", "msg": "Desconectado"})
@@ -74,15 +74,15 @@ def handle_peer(conn, addr):
                 else:
                     send_json(conn, {"status": "error", "msg": "Você não está logado"})
 
-            elif cmd == 'LIST_PEERS':
+            elif cmd == 'LIST_PEERS':  #lista peers ativos
                 peers_list = list(active_peers.keys())
                 send_json(conn, {"status": "ok", "peers": peers_list})
 
-            elif cmd == 'LIST_ROOMS':
+            elif cmd == 'LIST_ROOMS': #lista salas  
                 rooms_list = list(rooms.keys())
                 send_json(conn, {"status": "ok", "rooms": rooms_list})
 
-            elif cmd == 'CREATE_ROOM':
+            elif cmd == 'CREATE_ROOM':  #cria salas novas
                 room = msg.get('room')
                 if room in rooms:
                     send_json(conn, {"status": "error", "msg": "Sala já existe"})
@@ -90,7 +90,7 @@ def handle_peer(conn, addr):
                     rooms[room] = set()
                     send_json(conn, {"status": "ok", "msg": f"Sala '{room}' criada"})
 
-            elif cmd == 'JOIN_ROOM':
+            elif cmd == 'JOIN_ROOM':   #entra em sala existente
                 room = msg.get('room')
                 if room not in rooms:
                     send_json(conn, {"status": "error", "msg": "Sala não existe"})
@@ -105,7 +105,7 @@ def handle_peer(conn, addr):
             else:
                 send_json(conn, {"status": "error", "msg": "Comando desconhecido"})
 
-    except Exception as e:
+    except Exception as e:   #eventuais erros
         print(f"[ERRO] {e}")
 
     finally:
