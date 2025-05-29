@@ -2,29 +2,31 @@ import socket
 import threading
 import json
 import hashlib
+import sqlite3
 
-HOST = '0.0.0.0' 
-PORT = 12345      
+HOST = '0.0.0.0'
+PORT = 12345
+DB_PATH = 'tracker.db'
 
-#banco de usuários 
-users_db = {
-    'alice': hashlib.sha256('alicepass'.encode()).hexdigest(),
-    'bob': hashlib.sha256('bobpass'.encode()).hexdigest(),
-    'carol': hashlib.sha256('carolpass'.encode()).hexdigest()
-}
+active_peers = {}
+rooms = {}
 
-active_peers = {} 
-rooms = {}         
-
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
 
 def send_json(conn, obj):
     msg = json.dumps(obj).encode()
-    # protocolo simples: envia tamanho + dados para delimitar mensagem
     conn.sendall(len(msg).to_bytes(4, 'big') + msg)
 
-
 def recv_json(conn):
-    # lê 4 bytes do tamanho
     length_bytes = conn.recv(4)
     if not length_bytes:
         return None
@@ -37,7 +39,6 @@ def recv_json(conn):
         data += packet
     return json.loads(data.decode())
 
-
 def handle_peer(conn, addr):
     user = None
     try:
@@ -47,25 +48,51 @@ def handle_peer(conn, addr):
                 break
 
             cmd = msg.get('cmd')
-            if cmd == 'LOGIN':  #fazer login
+            
+            if cmd == 'REGISTER':
                 username = msg.get('user')
                 password = msg.get('password')
-                if username in users_db:  #se o user existe
-                    hash_pw = hashlib.sha256(password.encode()).hexdigest()
-                    if hash_pw == users_db[username]:
-                        if username in active_peers:  #checa se o user ja ta logado
-                            send_json(conn, {"status": "error", "msg": "Usuário já logado"})
-                        else:              #loga o usuario
-                            user = username
-                            active_peers[user] = (conn, addr)
-                            send_json(conn, {"status": "ok", "msg": f"Bem vindo, {user}!"})
-                            print(f"[LOGIN] {user} conectado de {addr}")
-                    else:
-                        send_json(conn, {"status": "error", "msg": "Senha incorreta"})
+                if not username or not password:
+                    send_json(conn, {"status": "error", "msg": "Usuário e senha são obrigatórios"})
                 else:
-                    send_json(conn, {"status": "error", "msg": "Usuário não existe"})
+                    with sqlite3.connect(DB_PATH) as conn_db:
+                        c = conn_db.cursor()
+                        c.execute('SELECT * FROM users WHERE username = ?', (username,))
+                        if c.fetchone():
+                            send_json(conn, {"status": "error", "msg": "Usuário já existe"})
+                        else:
+                            hash_pw = hashlib.sha256(password.encode()).hexdigest()
+                            c.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)', (username, hash_pw))
+                            conn_db.commit()
+                            send_json(conn, {"status": "ok", "msg": f"Usuário '{username}' registrado com sucesso"})
 
-            elif cmd == 'LOGOUT':   #fazer logout
+            elif cmd == 'LOGIN':
+                username = msg.get('user')
+                password = msg.get('password')
+                if not username or not password:
+                    send_json(conn, {"status": "error", "msg": "Credenciais inválidas"})
+                    continue
+
+                with sqlite3.connect(DB_PATH) as conn_db:
+                    c = conn_db.cursor()
+                    c.execute('SELECT password_hash FROM users WHERE username = ?', (username,))
+                    row = c.fetchone()
+                    if not row:
+                        send_json(conn, {"status": "error", "msg": "Usuário não existe"})
+                    else:
+                        hash_pw = hashlib.sha256(password.encode()).hexdigest()
+                        if hash_pw == row[0]:
+                            if username in active_peers:
+                                send_json(conn, {"status": "error", "msg": "Usuário já logado"})
+                            else:
+                                user = username
+                                active_peers[user] = (conn, addr)
+                                send_json(conn, {"status": "ok", "msg": f"Bem vindo, {user}!"})
+                                print(f"[LOGIN] {user} conectado de {addr}")
+                        else:
+                            send_json(conn, {"status": "error", "msg": "Senha incorreta"})
+
+            elif cmd == 'LOGOUT':
                 if user:
                     del active_peers[user]
                     send_json(conn, {"status": "ok", "msg": "Desconectado"})
@@ -74,15 +101,15 @@ def handle_peer(conn, addr):
                 else:
                     send_json(conn, {"status": "error", "msg": "Você não está logado"})
 
-            elif cmd == 'LIST_PEERS':  #lista peers ativos
+            elif cmd == 'LIST_PEERS':
                 peers_list = list(active_peers.keys())
                 send_json(conn, {"status": "ok", "peers": peers_list})
 
-            elif cmd == 'LIST_ROOMS': #lista salas  
+            elif cmd == 'LIST_ROOMS':
                 rooms_list = list(rooms.keys())
                 send_json(conn, {"status": "ok", "rooms": rooms_list})
 
-            elif cmd == 'CREATE_ROOM':  #cria salas novas
+            elif cmd == 'CREATE_ROOM':
                 room = msg.get('room')
                 if room in rooms:
                     send_json(conn, {"status": "error", "msg": "Sala já existe"})
@@ -90,7 +117,7 @@ def handle_peer(conn, addr):
                     rooms[room] = set()
                     send_json(conn, {"status": "ok", "msg": f"Sala '{room}' criada"})
 
-            elif cmd == 'JOIN_ROOM':   #entra em sala existente
+            elif cmd == 'JOIN_ROOM':
                 room = msg.get('room')
                 if room not in rooms:
                     send_json(conn, {"status": "error", "msg": "Sala não existe"})
@@ -105,7 +132,7 @@ def handle_peer(conn, addr):
             else:
                 send_json(conn, {"status": "error", "msg": "Comando desconhecido"})
 
-    except Exception as e:   #eventuais erros
+    except Exception as e:
         print(f"[ERRO] {e}")
 
     finally:
@@ -114,16 +141,15 @@ def handle_peer(conn, addr):
             print(f"[DESCONECTADO] {user} saiu")
         conn.close()
 
-
 def main():
+    init_db()
     print(f"Tracker iniciando em {HOST}:{PORT}")
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:  #scoekts
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, PORT))
         s.listen()
         while True:
             conn, addr = s.accept()
             threading.Thread(target=handle_peer, args=(conn, addr), daemon=True).start()
-
 
 if __name__ == '__main__':
     main()
