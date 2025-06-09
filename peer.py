@@ -5,7 +5,7 @@ import sys
 from crypto_utils import generate_keys, serialize_public_key, load_public_key, encrypt_message, decrypt_message
 
 TRACKER_HOST = '127.0.0.1'
-TRACKER_PORT = 12345
+TRACKER_PORT = 12346
 
 peer_connections = {}
 user_public_keys = {}
@@ -51,7 +51,7 @@ def handle_peer_conn(conn, addr):
             msg = decrypt_message(private_key, enc_msg)
             print(f"\n[PRIVADO] {msg}")
     except Exception as e:
-        print(f"[ERRO] conexão com peer perdida: {e}")
+        print(f"[ERRO] conexão com peer perdida. {e}")
         conn.close()
 
 def start_peer_server(port):
@@ -95,17 +95,17 @@ def peer_menu(tracker):
 
     def print_help():
         print("\n=== Comandos Disponíveis ===")
-        print("register       → Criar novo usuário")
-        print("login          → Fazer login")
-        print("list_peers     → Listar usuários online")
-        print("list_rooms     → Listar salas existentes")
-        print("create_room    → Criar nova sala de chat")
-        print("join_room      → Entrar em uma sala")
-        print("connect_peer   → Conectar-se a outro peer")
-        print("msg            → Enviar mensagem privada para peer conectado")
-        print("show_key       → Mostrar sua chave pública")
-        print("logout         → Sair da conta atual")
-        print("exit           → Fechar o programa")
+        print("register       -> Criar novo usuário")
+        print("login          -> Fazer login")
+        print("list_peers     -> Listar usuários online")
+        print("list_rooms     -> Listar salas existentes")
+        print("create_room    -> Criar nova sala de chat")
+        print("join_room      -> Entrar em uma sala")
+        print("connect_peer   -> Conectar-se a outro peer")
+        print("msg            -> Enviar mensagem privada para peer conectado")
+        print("show_key       -> Mostrar sua chave pública")
+        print("logout         -> Sair da conta atual")
+        print("exit           -> Fechar o programa")
 
     print_help()
 

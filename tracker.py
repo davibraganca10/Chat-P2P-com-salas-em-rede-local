@@ -5,7 +5,7 @@ import hashlib
 import sqlite3
 
 HOST = '0.0.0.0'
-PORT = 12345
+PORT = 12346
 DB_PATH = 'tracker.db'
 
 active_peers = {}
@@ -42,6 +42,7 @@ def recv_json(conn):
 def handle_peer(conn, addr):
     user = None
     try:
+        print(f"[CONEXÃO] Novo peer conectado de {addr}")
         while True:
             msg = recv_json(conn)
             if msg is None:
@@ -94,7 +95,12 @@ def handle_peer(conn, addr):
 
             elif cmd == 'LOGOUT':
                 if user:
-                    del active_peers[user]
+                    for room_name, members in rooms.items():
+                        if user in members:
+                            members.remove(user)
+                            print(f"[SAIR SALA] {user} saiu da sala '{room_name}'")
+                    if user in active_peers:
+                        del active_peers[user]
                     send_json(conn, {"status": "ok", "msg": "Desconectado"})
                     print(f"[LOGOUT] {user} desconectado")
                     break
@@ -102,31 +108,41 @@ def handle_peer(conn, addr):
                     send_json(conn, {"status": "error", "msg": "Você não está logado"})
 
             elif cmd == 'LIST_PEERS':
-                peers_list = list(active_peers.keys())
-                send_json(conn, {"status": "ok", "peers": peers_list})
+                if not user:
+                    send_json(conn, {"status": "error", "msg": "Você precisa estar logado"})
+                else:
+                    peers_list = list(active_peers.keys())
+                    send_json(conn, {"status": "ok", "peers": peers_list})
 
             elif cmd == 'LIST_ROOMS':
-                rooms_list = list(rooms.keys())
-                send_json(conn, {"status": "ok", "rooms": rooms_list})
+                if not user:
+                    send_json(conn, {"status": "error", "msg": "Você precisa estar logado"})
+                else:
+                    rooms_list = list(rooms.keys())
+                    send_json(conn, {"status": "ok", "rooms": rooms_list})
 
             elif cmd == 'CREATE_ROOM':
                 room = msg.get('room')
-                if room in rooms:
+                if not user:
+                    send_json(conn, {"status": "error", "msg": "Você precisa estar logado para criar salas"})
+                elif room in rooms:
                     send_json(conn, {"status": "error", "msg": "Sala já existe"})
                 else:
                     rooms[room] = set()
+                    print(f"[CRIAR SALA] {user} criou a sala '{room}'")
                     send_json(conn, {"status": "ok", "msg": f"Sala '{room}' criada"})
 
             elif cmd == 'JOIN_ROOM':
                 room = msg.get('room')
-                if room not in rooms:
-                    send_json(conn, {"status": "error", "msg": "Sala não existe"})
-                elif not user:
+                if not user:
                     send_json(conn, {"status": "error", "msg": "Faça login primeiro"})
+                elif room not in rooms:
+                    send_json(conn, {"status": "error", "msg": "Sala não existe"})
                 elif user in rooms[room]:
                     send_json(conn, {"status": "error", "msg": "Você já está na sala"})
                 else:
                     rooms[room].add(user)
+                    print(f"[ENTRAR SALA] {user} entrou na sala '{room}'")
                     send_json(conn, {"status": "ok", "msg": f"Entrou na sala '{room}'"})
 
             else:
@@ -136,9 +152,14 @@ def handle_peer(conn, addr):
         print(f"[ERRO] {e}")
 
     finally:
-        if user and user in active_peers:
-            del active_peers[user]
-            print(f"[DESCONECTADO] {user} saiu")
+        if user:
+            for room_name, members in rooms.items():
+                if user in members:
+                    members.remove(user)
+                    print(f"[DESCONECTADO] {user} removido da sala '{room_name}'")
+            if user in active_peers:
+                del active_peers[user]
+                print(f"[DESCONECTADO] {user} desconectado")
         conn.close()
 
 def main():
