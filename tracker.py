@@ -5,11 +5,15 @@ import hashlib
 import sqlite3
 
 HOST = '0.0.0.0'
-PORT = 12346
+PORT = 12345
 DB_PATH = 'tracker.db'
 
+# Dicionário de peers ativos: { 'username': (conn, addr) }
 active_peers = {}
+# Dicionário de salas: { 'room_name': {'owner': 'username', 'members': {'user1', 'user2'}} }
 rooms = {}
+# Mapeia qual usuário está em qual sala: { 'username': 'room_name' }
+user_current_room = {}
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -39,6 +43,16 @@ def recv_json(conn):
         data += packet
     return json.loads(data.decode())
 
+def close_room(room_name):
+    """Fecha uma sala, removendo-a e desvinculando todos os seus membros."""
+    print(f"[FECHAR SALA] Fechando a sala '{room_name}'.")
+    if room_name in rooms:
+        members_to_notify = rooms[room_name]['members']
+        for member in members_to_notify:
+            if member in user_current_room:
+                del user_current_room[member]
+        del rooms[room_name]
+
 def handle_peer(conn, addr):
     user = None
     try:
@@ -51,6 +65,7 @@ def handle_peer(conn, addr):
             cmd = msg.get('cmd')
             
             if cmd == 'REGISTER':
+                # (Lógica original mantida)
                 username = msg.get('user')
                 password = msg.get('password')
                 if not username or not password:
@@ -68,6 +83,7 @@ def handle_peer(conn, addr):
                             send_json(conn, {"status": "ok", "msg": f"Usuário '{username}' registrado com sucesso"})
 
             elif cmd == 'LOGIN':
+                # (Lógica original mantida)
                 username = msg.get('user')
                 password = msg.get('password')
                 if not username or not password:
@@ -87,20 +103,16 @@ def handle_peer(conn, addr):
                                 send_json(conn, {"status": "error", "msg": "Usuário já logado"})
                             else:
                                 user = username
-                                active_peers[user] = (conn, addr)
+                                # A porta do peer é a porta em que ele escuta, não a porta da conexão com o tracker
+                                peer_listen_port = msg.get('port')
+                                active_peers[user] = (conn, (addr[0], peer_listen_port))
                                 send_json(conn, {"status": "ok", "msg": f"Bem vindo, {user}!"})
-                                print(f"[LOGIN] {user} conectado de {addr}")
+                                print(f"[LOGIN] {user} conectado de {addr} (ouvindo na porta {peer_listen_port})")
                         else:
                             send_json(conn, {"status": "error", "msg": "Senha incorreta"})
 
             elif cmd == 'LOGOUT':
                 if user:
-                    for room_name, members in rooms.items():
-                        if user in members:
-                            members.remove(user)
-                            print(f"[SAIR SALA] {user} saiu da sala '{room_name}'")
-                    if user in active_peers:
-                        del active_peers[user]
                     send_json(conn, {"status": "ok", "msg": "Desconectado"})
                     print(f"[LOGOUT] {user} desconectado")
                     break
@@ -125,25 +137,69 @@ def handle_peer(conn, addr):
                 room = msg.get('room')
                 if not user:
                     send_json(conn, {"status": "error", "msg": "Você precisa estar logado para criar salas"})
+                elif user in user_current_room:
+                    send_json(conn, {"status": "error", "msg": f"Você já está na sala '{user_current_room[user]}'. Saia primeiro."})
                 elif room in rooms:
                     send_json(conn, {"status": "error", "msg": "Sala já existe"})
                 else:
-                    rooms[room] = set()
+                    rooms[room] = {'owner': user, 'members': {user}}
+                    user_current_room[user] = room
                     print(f"[CRIAR SALA] {user} criou a sala '{room}'")
-                    send_json(conn, {"status": "ok", "msg": f"Sala '{room}' criada"})
+                    send_json(conn, {"status": "ok", "msg": f"Sala '{room}' criada e você foi adicionado a ela."})
 
             elif cmd == 'JOIN_ROOM':
                 room = msg.get('room')
                 if not user:
                     send_json(conn, {"status": "error", "msg": "Faça login primeiro"})
+                elif user in user_current_room:
+                    send_json(conn, {"status": "error", "msg": f"Você já está na sala '{user_current_room[user]}'. Saia primeiro."})
                 elif room not in rooms:
                     send_json(conn, {"status": "error", "msg": "Sala não existe"})
-                elif user in rooms[room]:
-                    send_json(conn, {"status": "error", "msg": "Você já está na sala"})
                 else:
-                    rooms[room].add(user)
+                    members_info = []
+                    for member in rooms[room]['members']:
+                        if member in active_peers:
+                            member_conn, member_addr = active_peers[member]
+                            members_info.append({
+                                "user": member,
+                                "ip": member_addr[0],
+                                "port": member_addr[1]
+                            })
+                    
+                    rooms[room]['members'].add(user)
+                    user_current_room[user] = room
                     print(f"[ENTRAR SALA] {user} entrou na sala '{room}'")
-                    send_json(conn, {"status": "ok", "msg": f"Entrou na sala '{room}'"})
+
+                    send_json(conn, {
+                        "status": "ok",
+                        "msg": f"Entrou na sala '{room}'",
+                        "members": members_info
+                    })
+            
+            elif cmd == 'LEAVE_ROOM':
+                if not user:
+                    send_json(conn, {"status": "error", "msg": "Você não está logado."})
+                elif user not in user_current_room:
+                    send_json(conn, {"status": "error", "msg": "Você não está em nenhuma sala."})
+                else:
+                    room_name = user_current_room[user]
+                    del user_current_room[user]
+
+                    if room_name in rooms:
+                        rooms[room_name]['members'].remove(user)
+                        print(f"[SAIR SALA] {user} saiu da sala '{room_name}'")
+                        
+                        is_owner = rooms[room_name]['owner'] == user
+                        if is_owner:
+                            send_json(conn, {"status": "ok", "msg": f"Você era o dono e saiu. A sala '{room_name}' foi fechada."})
+                            close_room(room_name)
+                        elif not rooms[room_name]['members']:
+                            send_json(conn, {"status": "ok", "msg": f"Você era o último membro. A sala '{room_name}' foi fechada."})
+                            close_room(room_name)
+                        else:
+                            send_json(conn, {"status": "ok", "msg": f"Você saiu da sala '{room_name}'."})
+                    else:
+                         send_json(conn, {"status": "ok", "msg": "Você saiu de uma sala que não existe mais."})
 
             else:
                 send_json(conn, {"status": "error", "msg": "Comando desconhecido"})
@@ -153,10 +209,21 @@ def handle_peer(conn, addr):
 
     finally:
         if user:
-            for room_name, members in rooms.items():
-                if user in members:
-                    members.remove(user)
-                    print(f"[DESCONECTADO] {user} removido da sala '{room_name}'")
+            if user in user_current_room:
+                room_name = user_current_room[user]
+                del user_current_room[user]
+                if room_name in rooms:
+                    if user in rooms[room_name]['members']:
+                        rooms[room_name]['members'].remove(user)
+                    
+                    is_owner = rooms[room_name]['owner'] == user
+                    if is_owner:
+                        print(f"[DONO DESCONECTOU] Dono '{user}' da sala '{room_name}' desconectou.")
+                        close_room(room_name)
+                    elif not rooms[room_name]['members']:
+                        print(f"[SALA VAZIA] A sala '{room_name}' ficou vazia e será fechada.")
+                        close_room(room_name)
+
             if user in active_peers:
                 del active_peers[user]
                 print(f"[DESCONECTADO] {user} desconectado")
