@@ -8,14 +8,44 @@ from crypto_utils import generate_keys, serialize_public_key, load_public_key, e
 
 
 TRACKER_HOST = '127.0.0.1'
-TRACKER_PORT = 12345
+TRACKER_PORT = 12347
 connections_lock = threading.Lock()
 peer_connections = {}
 user_public_keys = {}
+room_peers = set()  # Peers que estão na mesma sala que você
 current_room = None
 my_username = None
 private_key, public_key = generate_keys()
 tracker_responses = Queue()
+tracker_conn = None  # Variável global para a conexão do tracker
+intentional_disconnect = False  # Flag para logout intencional
+
+def get_tracker_response(timeout=5):
+    """Obtém resposta do tracker com tratamento de erro"""
+    try:
+        return tracker_responses.get(block=True, timeout=timeout)
+    except:
+        return None
+
+def reconnect_to_tracker(peer_port):
+    """Reconecta ao tracker se a conexão foi perdida"""
+    global tracker_conn
+    if tracker_conn is not None:
+        return tracker_conn  # Já conectado
+    
+    try:
+        print("[INFO] Tentando reconectar ao tracker...")
+        tracker_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tracker_conn.connect((TRACKER_HOST, TRACKER_PORT))
+        # Inicia nova thread para escutar o tracker
+        threading.Thread(target=listen_to_tracker, args=(tracker_conn,), daemon=True).start()
+        print("[INFO] Reconectado ao tracker com sucesso.")
+        return tracker_conn
+    except Exception as e:
+        print(f"[ERRO] Falha ao reconectar ao tracker: {e}")
+        tracker_conn = None
+        return None
+
 def send_json(sock, obj):
     try:
         data = json.dumps(obj).encode()
@@ -48,6 +78,7 @@ def disconnect_from_all_peers():
             except: pass
         peer_connections.clear()
         user_public_keys.clear()
+        room_peers.clear()  # Limpa também os peers da sala
     if current_room:
         print(f"\n[INFO] Você saiu da sala '{current_room}'.")
         current_room = None
@@ -66,6 +97,7 @@ def listen_to_peer_messages(conn, peer_name):
         with connections_lock:
             if peer_name in peer_connections: del peer_connections[peer_name]
             if peer_name in user_public_keys: del user_public_keys[peer_name]
+            room_peers.discard(peer_name)  # Remove da lista de peers da sala
             print(f"\n[INFO] Conexão com {peer_name} encerrada.")
         conn.close()
 def handle_peer_conn(conn, addr):
@@ -75,10 +107,23 @@ def handle_peer_conn(conn, addr):
         if not peer_info: return
         peer_name = peer_info["user"]
         peer_key = load_public_key(peer_info["pubkey"])
-        send_json(conn, {"user": my_username, "pubkey": serialize_public_key(public_key)})
+        is_room_connection = peer_info.get("is_room_connection", False)
+        remote_room = peer_info.get("room", None)
+        
+        # Responde com suas informações
+        response_info = {
+            "user": my_username, 
+            "pubkey": serialize_public_key(public_key)
+        }
+        send_json(conn, response_info)
+        
         with connections_lock:
             peer_connections[peer_name] = conn
             user_public_keys[peer_name] = peer_key
+            # Só adiciona ao room_peers se for uma conexão de sala E estiverem na mesma sala
+            if is_room_connection and current_room and remote_room == current_room:
+                room_peers.add(peer_name)
+                
         print(f"\n[INFO] {peer_name} conectou-se a você.")
         listen_to_peer_messages(conn, peer_name)
     except Exception: conn.close()
@@ -92,11 +137,18 @@ def start_peer_server(port):
             conn, addr = srv.accept()
             threading.Thread(target=handle_peer_conn, args=(conn, addr), daemon=True).start()
     threading.Thread(target=server, daemon=True).start()
-def connect_to_peer(ip, port):
+def connect_to_peer(ip, port, is_room_connection=False):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((ip, port))
-        send_json(sock, {"user": my_username, "pubkey": serialize_public_key(public_key)})
+        # Envia informação sobre o tipo de conexão
+        connection_info = {
+            "user": my_username, 
+            "pubkey": serialize_public_key(public_key),
+            "is_room_connection": is_room_connection,
+            "room": current_room if is_room_connection else None
+        }
+        send_json(sock, connection_info)
         remote_info = recv_json(sock)
         if not remote_info: raise ConnectionError("Handshake falhou.")
         peer_name = remote_info["user"]
@@ -104,6 +156,9 @@ def connect_to_peer(ip, port):
         with connections_lock:
             peer_connections[peer_name] = sock
             user_public_keys[peer_name] = peer_key
+            # Só adiciona ao room_peers se for uma conexão de sala
+            if is_room_connection:
+                room_peers.add(peer_name)
         print(f"\n[INFO] Conectado a {peer_name}")
         threading.Thread(target=listen_to_peer_messages, args=(sock, peer_name), daemon=True).start()
         return peer_name
@@ -111,10 +166,15 @@ def connect_to_peer(ip, port):
         print(f"\n[ERRO] Falha ao conectar-se ao peer {ip}:{port}. {e}")
         return None
 def listen_to_tracker(sock):
+    global tracker_conn, intentional_disconnect
     while True:
         msg = recv_json(sock)
         if msg is None:
-            print("\n[ERRO] Conexão com o tracker perdida."); break
+            if not intentional_disconnect:
+                print("\n[ERRO] Conexão com o tracker perdida.")
+            tracker_conn = None  # Marca que a conexão foi perdida
+            intentional_disconnect = False  # Reset da flag
+            break
         if "event" in msg:
             event = msg["event"]
             if event == "ROOM_CLOSED":
@@ -151,7 +211,8 @@ def enter_chat_loop(mode, target_peer=None):
         if mode == "room":
             msg_to_send = f"[{current_room}][{my_username}]: {msg_text}"
             with connections_lock:
-                peers_to_send = list(peer_connections.items())
+                # Envia apenas para peers que estão na mesma sala
+                peers_to_send = [(name, sock) for name, sock in peer_connections.items() if name in room_peers]
             for peer_name, peer_sock in peers_to_send:
                 try:
                     pubkey = user_public_keys[peer_name]
@@ -178,10 +239,13 @@ def enter_chat_loop(mode, target_peer=None):
 
 
 def peer_menu(tracker, peer_port):
-    global my_username, current_room
+    global my_username, current_room, tracker_conn, intentional_disconnect
+    tracker_conn = tracker  # Inicializa a variável global
 
     def print_help():
         print("\n" + "="*15 + " Comandos Disponíveis " + "="*15)
+        print(" register        -> Criar novo usuário")
+        print(" login           -> Fazer login")
         print(" list_peers      -> Listar usuários online")
         print(" list_rooms      -> Listar salas existentes")
         print(" list_conn       -> Listar peers aos quais você está conectado")
@@ -195,76 +259,145 @@ def peer_menu(tracker, peer_port):
         print(" exit            -> Fechar o programa")
         print("="*52)
     
-    threading.Thread(target=listen_to_tracker, args=(tracker,), daemon=True).start()
+    threading.Thread(target=listen_to_tracker, args=(tracker_conn,), daemon=True).start()
     print_help()
 
     while True:
         cmd = input("\nDigite comando: ").strip().lower()
         
         if cmd == 'help': print_help()
-        elif cmd == 'exit': break
+        elif cmd == 'exit': 
+            intentional_disconnect = True  # Marca como desconexão intencional
+            break
         
         if cmd == 'register':
+            if not tracker_conn:
+                tracker_conn = reconnect_to_tracker(peer_port)
+                if not tracker_conn:
+                    print("[ERRO] Não é possível se registrar sem conexão com o tracker.")
+                    continue
             user = input("Usuário: ")
             pwd = getpass.getpass("Senha: ")
-            send_json(tracker, {"cmd": "REGISTER", "user": user, "password": pwd})
-            print(tracker_responses.get()); continue
+            send_json(tracker_conn, {"cmd": "REGISTER", "user": user, "password": pwd})
+            resp = get_tracker_response()
+            print(resp if resp else "[ERRO] Não foi possível obter resposta do tracker.")
+            continue
         elif cmd == 'login':
             if my_username: print("[ERRO] Você já está logado."); continue
+            if not tracker_conn:
+                tracker_conn = reconnect_to_tracker(peer_port)
+                if not tracker_conn:
+                    print("[ERRO] Não é possível fazer login sem conexão com o tracker.")
+                    continue
             user = input("Usuário: ")
             pwd = getpass.getpass("Senha: ")
-            send_json(tracker, {"cmd": "LOGIN", "user": user, "password": pwd, "port": peer_port})
-            resp = tracker_responses.get()
+            send_json(tracker_conn, {"cmd": "LOGIN", "user": user, "password": pwd, "port": peer_port})
+            resp = get_tracker_response()
             if resp and resp.get("status") == "ok": my_username = user
-            print(resp); continue
+            print(resp if resp else "[ERRO] Não foi possível obter resposta do tracker.")
+            continue
         
         if not my_username:
             print("[ERRO] Comando inválido ou requer login. Comandos disponíveis: register, login, exit."); continue
             
         # ... (comandos list, create, join, etc. sem alterações) ...
         if cmd == 'list_peers':
-            send_json(tracker, {"cmd": "LIST_PEERS"})
-            print("Peers online:", tracker_responses.get().get("peers", []))
+            if not tracker_conn:
+                tracker_conn = reconnect_to_tracker(peer_port)
+                if not tracker_conn:
+                    print("[ERRO] Não é possível listar peers sem conexão com o tracker.")
+                    continue
+            send_json(tracker_conn, {"cmd": "LIST_PEERS"})
+            resp = get_tracker_response()
+            if resp:
+                print("Peers online:", resp.get("peers", []))
+            else:
+                print("[ERRO] Não foi possível obter lista de peers.")
         elif cmd == 'list_rooms':
-            send_json(tracker, {"cmd": "LIST_ROOMS"})
-            resp = tracker_responses.get()
-            print("Salas disponíveis:")
-            for room_info in resp.get("rooms", []): print(f" - {room_info}")
+            if not tracker_conn:
+                tracker_conn = reconnect_to_tracker(peer_port)
+                if not tracker_conn:
+                    print("[ERRO] Não é possível listar salas sem conexão com o tracker.")
+                    continue
+            send_json(tracker_conn, {"cmd": "LIST_ROOMS"})
+            resp = get_tracker_response()
+            if resp:
+                print("Salas disponíveis:")
+                for room_info in resp.get("rooms", []): print(f" - {room_info}")
+            else:
+                print("[ERRO] Não foi possível obter lista de salas.")
             #aqui só lista com quem vc ta conectado
         elif cmd == 'list_conn':
             with connections_lock:
-                if not peer_connections: print("Você não está conectado a nenhum peer.")
-                else: print("Conectado a:", list(peer_connections.keys()))
+                if not peer_connections: 
+                    print("Você não está conectado a nenhum peer.")
+                else: 
+                    print("Conectado a:", list(peer_connections.keys()))
+                    if room_peers:
+                        print(f"Peers na sala '{current_room}':", list(room_peers))
+                    direct_peers = set(peer_connections.keys()) - room_peers
+                    if direct_peers:
+                        print("Conexões diretas (fora da sala):", list(direct_peers))
         elif cmd == 'create_room':
+            if not tracker_conn:
+                tracker_conn = reconnect_to_tracker(peer_port)
+                if not tracker_conn:
+                    print("[ERRO] Não é possível criar sala sem conexão com o tracker.")
+                    continue
             room = input("Nome da sala: ")
             is_private = input("A sala será privada com senha? (s/n): ").lower() == 's'
             password = None
             if is_private: password = getpass.getpass("Digite a senha para a nova sala: ")
             disconnect_from_all_peers()
-            send_json(tracker, {"cmd": "CREATE_ROOM", "room": room, "password": password})
-            resp = tracker_responses.get()
-            if resp and resp.get("status") == "ok": current_room = room
-            print(resp)
+            send_json(tracker_conn, {"cmd": "CREATE_ROOM", "room": room, "password": password})
+            resp = get_tracker_response()
+            if resp and resp.get("status") == "ok": 
+                current_room = room
+                with connections_lock:
+                    room_peers.clear()  # Nova sala, sem outros peers ainda
+            print(resp if resp else "[ERRO] Não foi possível obter resposta do tracker.")
         elif cmd == 'join_room':
+            if not tracker_conn:
+                tracker_conn = reconnect_to_tracker(peer_port)
+                if not tracker_conn:
+                    print("[ERRO] Não é possível entrar em sala sem conexão com o tracker.")
+                    continue
             room = input("Nome da sala: ")
             password = getpass.getpass("Senha (deixe em branco se for pública): ")
             disconnect_from_all_peers()
-            send_json(tracker, {"cmd": "JOIN_ROOM", "room": room, "password": password})
-            resp = tracker_responses.get()
-            print(resp.get("msg"))
-            if resp.get("status") == "ok":
-                current_room = room
-                for member in resp.get("members", []):
-                    if member["user"] != my_username: connect_to_peer(member["ip"], member["port"])
-                print("\nVocê entrou na sala. Comandos disponíveis:")
-                print_help()
+            send_json(tracker_conn, {"cmd": "JOIN_ROOM", "room": room, "password": password})
+            resp = get_tracker_response()
+            if resp:
+                print(resp.get("msg"))
+                if resp.get("status") == "ok":
+                    current_room = room
+                    with connections_lock:
+                        room_peers.clear()  # Limpa a lista anterior
+                    for member in resp.get("members", []):
+                        if member["user"] != my_username:
+                            connected_peer = connect_to_peer(member["ip"], member["port"], is_room_connection=True)
+                            if connected_peer:
+                                with connections_lock:
+                                    room_peers.add(connected_peer)  # Adiciona à lista de peers da sala
+                    print("\nVocê entrou na sala. Comandos disponíveis:")
+                    print_help()
+            else:
+                print("[ERRO] Não foi possível obter resposta do tracker.")
         elif cmd == 'leave_room':
             if not current_room: print("[ERRO] Você não está em nenhuma sala."); continue
-            send_json(tracker, {"cmd": "LEAVE_ROOM"})
-            resp = tracker_responses.get()
-            print(resp.get("msg"))
-            if resp and resp.get("status") == "ok":
-                disconnect_from_all_peers()
+            if not tracker_conn:
+                tracker_conn = reconnect_to_tracker(peer_port)
+                if not tracker_conn:
+                    print("[ERRO] Não é possível sair da sala sem conexão com o tracker.")
+                    continue
+            send_json(tracker_conn, {"cmd": "LEAVE_ROOM"})
+            resp = get_tracker_response()
+            if resp:
+                print(resp.get("msg"))
+                if resp.get("status") == "ok":
+                    disconnect_from_all_peers()  # Isso já limpa room_peers também
+            else:
+                print("[ERRO] Não foi possível obter resposta do tracker.")
 
        
         elif cmd == 'msg':
@@ -279,19 +412,24 @@ def peer_menu(tracker, peer_port):
             
             # se não, conecta
             if not is_connected:
+                if not tracker_conn:
+                    tracker_conn = reconnect_to_tracker(peer_port)
+                    if not tracker_conn:
+                        print("[ERRO] Não é possível conectar sem conexão com o tracker.")
+                        continue
                 print(f"[INFO] Não conectado a '{target}'. Buscando informações no tracker...")
-                send_json(tracker, {"cmd": "GET_PEER_INFO", "target_user": target})
-                resp = tracker_responses.get()
+                send_json(tracker_conn, {"cmd": "GET_PEER_INFO", "target_user": target})
+                resp = get_tracker_response()
 
                 if resp and resp.get("status") == "ok":
                     peer_ip = resp.get("ip")
                     peer_port = resp.get("port")
                     print(f"[INFO] Conectando diretamente a {target} em {peer_ip}:{peer_port}...")
-                    if not connect_to_peer(peer_ip, peer_port):
+                    if not connect_to_peer(peer_ip, peer_port, is_room_connection=False):
                         print(f"[ERRO] Falha ao estabelecer conexão direta com {target}.")
                         continue #volta pro menu
                 else:
-                    error_msg = resp.get("msg", "Não foi possível obter informações do peer.")
+                    error_msg = resp.get("msg", "Não foi possível obter informações do peer.") if resp else "Não foi possível obter resposta do tracker."
                     print(f"[ERRO] {error_msg}")
                     continue # tmb volta pro menu
 
@@ -304,12 +442,37 @@ def peer_menu(tracker, peer_port):
         #logica pra kickar alguém da sala.
         elif cmd == 'kick':
             if not current_room: print("[ERRO] Você precisa estar em uma sala para expulsar alguém."); continue
+            if not tracker_conn:
+                tracker_conn = reconnect_to_tracker(peer_port)
+                if not tracker_conn:
+                    print("[ERRO] Não é possível expulsar sem conexão com o tracker.")
+                    continue
             target = input("Quem você quer expulsar? (usuário): ")
-            send_json(tracker, {"cmd": "KICK_PEER", "room": current_room, "target_user": target})
-            print(tracker_responses.get())
+            send_json(tracker_conn, {"cmd": "KICK_PEER", "room": current_room, "target_user": target})
+            resp = get_tracker_response()
+            print(resp if resp else "[ERRO] Não foi possível obter resposta do tracker.")
         elif cmd == 'logout':
-            send_json(tracker, {"cmd": "LOGOUT"})
-            print(tracker_responses.get().get("msg"))
+            if tracker_conn:
+                try:
+                    intentional_disconnect = True  # Marca como desconexão intencional
+                    send_json(tracker_conn, {"cmd": "LOGOUT"})
+                    resp = get_tracker_response(timeout=2)
+                    if resp and resp.get("msg"):
+                        print(resp.get("msg"))
+                    else:
+                        print("Logout realizado.")
+                except:
+                    print("Logout realizado (sem conexão com tracker).")
+                finally:
+                    # Fecha a conexão com o tracker após logout
+                    try:
+                        tracker_conn.close()
+                    except:
+                        pass
+                    tracker_conn = None
+            else:
+                print("Logout realizado.")
+            
             disconnect_from_all_peers()
             my_username = None
             print("Você foi deslogado.")
@@ -318,25 +481,35 @@ def peer_menu(tracker, peer_port):
 
 
 def main():
+    global tracker_conn, my_username
     if len(sys.argv) < 2:
         print(f"Uso: python {sys.argv[0]} <porta_peer>"); sys.exit(1)
     peer_port = int(sys.argv[1])
     start_peer_server(peer_port)
-    tracker_conn = None
+    local_tracker_conn = None
     try:
-        tracker_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tracker_conn.connect((TRACKER_HOST, TRACKER_PORT))
-        peer_menu(tracker_conn, peer_port)
+        local_tracker_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        local_tracker_conn.connect((TRACKER_HOST, TRACKER_PORT))
+        peer_menu(local_tracker_conn, peer_port)
     except ConnectionRefusedError:
         print("[ERRO] Não foi possível conectar ao tracker. Verifique se ele está online.")
     except Exception as e:
         print(f"[ERRO] Uma exceção inesperada ocorreu: {e}")
     finally:
-        if my_username and tracker_conn:
-             send_json(tracker_conn, {"cmd": "LOGOUT"})
+        # Só tenta logout se ainda há usuário logado e conexão ativa
+        if my_username and tracker_conn and not intentional_disconnect:
+            try:
+                send_json(tracker_conn, {"cmd": "LOGOUT"})
+            except:
+                pass  # Ignora erros ao tentar fazer logout na saída
         print("Encerrando cliente...")
         disconnect_from_all_peers()
-        if tracker_conn: tracker_conn.close()
+        # Fecha a conexão local se ainda estiver aberta
+        if local_tracker_conn:
+            try:
+                local_tracker_conn.close()
+            except:
+                pass
 
 if __name__ == '__main__':
     main()

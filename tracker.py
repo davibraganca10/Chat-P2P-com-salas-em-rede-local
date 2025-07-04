@@ -5,7 +5,7 @@ import hashlib
 import sqlite3
 
 HOST = '0.0.0.0'
-PORT = 12345
+PORT = 12347
 DB_PATH = 'tracker.db'
 
 active_peers = {}
