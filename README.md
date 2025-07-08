@@ -92,13 +92,5 @@ Após iniciar o peer, utilize os comandos disponíveis:
 
 ---
 
-### Sugestões de Discussão Acadêmica
-- Limitações do modelo P2P com tracker centralizado
-- Alternativas para autenticação e distribuição de chaves
-- Possíveis ataques e vetores de ameaça
-- Extensões: suporte a arquivos, interface gráfica, NAT traversal
-
----
-
 ### Licença
 Este projeto é de uso acadêmico e livre para fins educacionais.
